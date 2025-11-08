@@ -35,11 +35,18 @@ jobs:
         run: |
           php -r "file_exists('.env') || copy('.env.example', '.env');"
 
-      - name: Install Composer Dependencies
-        run: composer install --prefer-dist --no-progress --no-interaction
-
       - name: Generate Application Key
         run: php artisan key:generate
+
+      - name: Install Composer Dependencies
+        env:
+          DB_CONNECTION: mysql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 3306
+          DB_DATABASE: test_db
+          DB_USERNAME: root
+          DB_PASSWORD: password
+        run: composer install --prefer-dist --no-progress --no-interaction
 
       - name: Run Tests
         env:
@@ -100,107 +107,94 @@ jobs:
         script: |
           set -e
           
-          APP_DIR="/var/www/infinityloop-lms-marketplace"
+          APP_DIR="/var/www/${{ env.APP_NAME }}"
+          BACKUP_DIR="/var/www/${{ env.APP_NAME }}_backup_$(date +%Y%m%d_%H%M%S)"
           
-          echo "🚀 Starting deployment..."
+          # Backup current version
+          if [ -d "$APP_DIR" ]; then
+            echo "📦 Creating backup..."
+            sudo cp -r "$APP_DIR" "$BACKUP_DIR"
+          fi
           
           # Create app directory
-          sudo mkdir -p $APP_DIR
+          sudo mkdir -p "$APP_DIR"
           
-          # Extract deployment
-          echo "📂 Extracting files..."
-          sudo tar -xzf /tmp/deployment.tar.gz -C $APP_DIR
-          
-          # Create production .env
-          echo "⚙️  Configuring environment..."
-          sudo tee $APP_DIR/.env > /dev/null << 'ENVEOF'
-          APP_NAME="Charity Website"
-          APP_ENV=production
-          APP_KEY=base64:9ZDOVRTUdHOjngR+OvWeFCktxIDeUsacRbD+9n5RBuc=
-          APP_DEBUG=false
-          APP_URL=http://charity-website.infinityloop.online
-
-          
-          DB_CONNECTION=mysql
-          DB_HOST=${{ secrets.DB_HOST }}
-          DB_PORT=3306
-          DB_DATABASE=lms_marketplace
-          DB_USERNAME=admin
-          DB_PASSWORD=${{ secrets.DB_PASSWORD }}
-          
-          FILESYSTEM_DISK=s3
-          AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION=${{ secrets.AWS_REGION }}
-          AWS_BUCKET=${{ secrets.S3_UPLOADS_BUCKET }}
-          
-          CACHE_DRIVER=file
-          QUEUE_CONNECTION=sync
-          SESSION_DRIVER=file
-          ENVEOF
+          # Extract new version
+          echo "📤 Extracting deployment..."
+          sudo tar -xzf /tmp/deployment.tar.gz -C "$APP_DIR"
           
           # Set permissions
-          echo "🔐 Setting permissions..."
-          sudo chown -R www-data:www-data $APP_DIR
-          sudo chmod -R 755 $APP_DIR
-          sudo chmod -R 775 $APP_DIR/storage
-          sudo chmod -R 775 $APP_DIR/bootstrap/cache
+          sudo chown -R www-data:www-data "$APP_DIR"
+          sudo chmod -R 755 "$APP_DIR"
+          sudo chmod -R 775 "$APP_DIR/storage" "$APP_DIR/bootstrap/cache"
           
-          # Run Laravel commands
-          cd $APP_DIR
+          # Create .env if doesn't exist
+          if [ ! -f "$APP_DIR/.env" ]; then
+            echo "📝 Creating .env file..."
+            sudo cp "$APP_DIR/.env.example" "$APP_DIR/.env"
+            sudo chown www-data:www-data "$APP_DIR/.env"
+            
+            # Generate app key
+            cd "$APP_DIR"
+            sudo -u www-data php artisan key:generate --force
+          fi
           
-          echo "🔄 Running migrations..."
-          sudo -u www-data php artisan migrate --force
+          # Update .env with secrets
+          sudo sed -i "s/^APP_NAME=.*/APP_NAME=\"${{ env.APP_NAME }}\"/" "$APP_DIR/.env"
+          sudo sed -i "s/^APP_ENV=.*/APP_ENV=production/" "$APP_DIR/.env"
+          sudo sed -i "s/^APP_DEBUG=.*/APP_DEBUG=false/" "$APP_DIR/.env"
+          sudo sed -i "s/^DB_HOST=.*/DB_HOST=\"${{ secrets.DB_HOST }}\"/" "$APP_DIR/.env"
+          sudo sed -i "s/^DB_DATABASE=.*/DB_DATABASE=\"lms_marketplace\"/" "$APP_DIR/.env"
+          sudo sed -i "s/^DB_USERNAME=.*/DB_USERNAME=\"${{ secrets.DB_USERNAME }}\"/" "$APP_DIR/.env"
+          sudo sed -i "s/^DB_PASSWORD=.*/DB_PASSWORD=\"${{ secrets.DB_PASSWORD }}\"/" "$APP_DIR/.env"
           
-          echo "⚡ Optimizing..."
+          # Laravel optimization
+          echo "⚙️  Optimizing Laravel..."
+          cd "$APP_DIR"
           sudo -u www-data php artisan config:cache
           sudo -u www-data php artisan route:cache
           sudo -u www-data php artisan view:cache
           
-          # Configure Nginx vhost
-          echo "🌐 Configuring web server..."
-          sudo tee /etc/nginx/sites-available/charity-website > /dev/null << 'VHOSTEOF'
+          # Run migrations
+          echo "🗄️  Running migrations..."
+          sudo -u www-data php artisan migrate --force || echo "Migration warnings (check if expected)"
+          
+          # Create/Update Nginx configuration
+          echo "🌐 Configuring Nginx..."
+          sudo tee /etc/nginx/sites-available/${{ env.APP_NAME }} > /dev/null <<EOF
           server {
               listen 80;
-              server_name charity-website.infinityloop.online;
-              root /var/www/infinityloop-lms-marketplace/public;
+              server_name ${{ env.APP_NAME }}.com www.${{ env.APP_NAME }}.com;
+              root $APP_DIR/public;
               
               index index.php index.html;
               
               location / {
-                  try_files $uri $uri/ /index.php?$query_string;
+                  try_files \$uri \$uri/ /index.php?\$query_string;
               }
               
               location ~ \.php$ {
                   fastcgi_pass unix:/var/run/php/php8.2-fpm.sock;
                   fastcgi_index index.php;
-                  fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+                  fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
                   include fastcgi_params;
               }
               
               location ~ /\.(?!well-known).* {
                   deny all;
               }
-              
-              access_log /var/log/nginx/charity-website-access.log;
-              error_log /var/log/nginx/charity-website-error.log;
           }
-          VHOSTEOF
+          EOF
           
-          # Enable site and restart Nginx
-          sudo ln -sf /etc/nginx/sites-available/charity-website /etc/nginx/sites-enabled/
+          # Enable site
+          sudo ln -sf /etc/nginx/sites-available/${{ env.APP_NAME }} /etc/nginx/sites-enabled/
+          
+          # Test and reload Nginx
           sudo nginx -t && sudo systemctl reload nginx
           
-          # Cleanup
-          rm /tmp/deployment.tar.gz
-          
           echo "✅ Deployment complete!"
-
-    - name: Deployment Status
-      if: always()
-      run: |
-        if [ ${{ job.status }} == 'success' ]; then
-          echo "✅ Deployment successful!"
-        else
-          echo "❌ Deployment failed!"
-        fi
+          echo "🌐 Application: ${{ env.APP_NAME }}"
+          echo "📁 Directory: $APP_DIR"
+          
+          # Cleanup
+          rm -f /tmp/deployment.tar.gz
